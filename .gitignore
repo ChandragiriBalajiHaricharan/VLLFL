@@ -1,0 +1,18 @@
+# Ignore Virtual Environment
+.venv/
+__pycache__/
+
+# Ignore Datasets
+archive/
+MetaFruit/
+10/
+
+# Ignore Trained Weights
+vllfl_adapters/
+vllfl_adapters_efficient/
+vllfl_adapters_fast/
+*.pth
+*.safetensors
+
+# Ignore VS Code settings
+.vscode/
