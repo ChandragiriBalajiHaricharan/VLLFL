@@ -38,15 +38,15 @@ def parse_args():
     p.add_argument("--data-root", default=r"C:\Users\balaj\OneDrive\Documents\project sem 5\archive\MetaFruit")
     p.add_argument("--fruits", nargs="+", default=["apple","grapefruit","lemon","orange","tangerine"])
     p.add_argument("--checkpoint", default="google/owlv2-base-patch16-ensemble")
-    p.add_argument("--batch-size", type=int, default=1, help="Per-step batch size (use 1 for GPU with 6GB VRAM)")
-    p.add_argument("--accum-steps", type=int, default=8, help="Gradient accumulation steps (simulates larger batch)")
+    p.add_argument("--batch-size", type=int, default=1, help="Per-step batch size (use 1 for CPU/small GPU)")
+    p.add_argument("--accum-steps", type=int, default=16, help="Gradient accumulation steps (CPU: use 16+)")
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--max-batches", type=int, default=0, help="If >0, stop after this many batches (smoke test)")
     # Windows + OneDrive can be slow with multiple workers; default to 0 for safety.
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--max-samples", type=int, default=0, help="If >0, limit dataset to this many samples per epoch")
-    p.add_argument("--lora-r", type=int, default=8, help="LoRA rank (smaller=r for speed)")
+    p.add_argument("--lora-r", type=int, default=4, help="LoRA rank (4-8; smaller=faster)")
     p.add_argument("--save-dir", default="vllfl_adapters_efficient")
     p.add_argument("--device", default="auto", choices=["cuda", "cpu", "auto"], help="Device to use (auto=cuda if available)")
     p.add_argument("--top-k", type=int, default=3, help="Number of top predictions to consider per sample (K)")
@@ -127,6 +127,16 @@ def box_iou(boxes1, boxes2):
     return iou
 
 
+class InMemoryDataset(torch.utils.data.Dataset):
+    """A small top-level Dataset to hold items in memory."""
+    def __init__(self, items):
+        self.items = items
+    def __len__(self):
+        return len(self.items)
+    def __getitem__(self, idx):
+        return self.items[idx]
+
+
 def main():
     args = parse_args()
     if args.device == "auto":
@@ -146,11 +156,19 @@ def main():
     model.train()
     model.print_trainable_parameters()
 
-    # Keep gradient checkpointing disabled for GPU - use gradient accumulation instead
-    try:
-        model.gradient_checkpointing_disable()
-    except Exception:
-        pass
+    # Enable gradient checkpointing on CPU/small GPU to save memory (trades compute for memory)
+    # On CUDA, disable it and use gradient accumulation instead.
+    if device == "cpu":
+        try:
+            model.gradient_checkpointing_enable()
+            print("Gradient checkpointing enabled for CPU training.")
+        except Exception as e:
+            print(f"Warning: could not enable gradient checkpointing: {e}")
+    else:
+        try:
+            model.gradient_checkpointing_disable()
+        except Exception:
+            pass
 
     # Dataset
     print("Building datasets...")
@@ -181,14 +199,6 @@ def main():
         items = []
         for i in range(len(train_dataset)):
             items.append(train_dataset[i])
-        from torch.utils.data import Dataset as _TorchDataset
-        class InMemoryDataset(_TorchDataset):
-            def __init__(self, items):
-                self.items = items
-            def __len__(self):
-                return len(self.items)
-            def __getitem__(self, idx):
-                return self.items[idx]
         train_dataset = InMemoryDataset(items)
         print(f"Cached dataset size: {len(train_dataset)}")
 
@@ -245,26 +255,11 @@ def main():
                 num = 0
                 # Use up to K predictions per sample (small K)
                 K = args.top_k
-                # compute loss (MSE) over matched positions (simple pairing up to K)
-                for i, t in enumerate(targets):
-                    if len(t['boxes']) == 0:
-                        continue
-                    n_targets = min(len(t['boxes']), K)
-                    for j in range(n_targets):
-                        tb = t['boxes'][j].to(device)
-                        pb = pred_boxes[i, j, :]
-                        loss = loss + F.mse_loss(pb, tb)
-                        num += 1
-                if num > 0:
-                    loss = loss / num
-                else:
-                    # skip updates if no targets
-                    loss = None
 
-                # Simple IoU-based accuracy (per-sample): a sample is correct if any of top-K preds
-                # has IoU >= threshold with any ground-truth box.
-                batch_correct = 0
-                batch_total = 0
+                # We'll perform greedy IoU matching between top-K preds and GT boxes
+                batch_matches = 0
+                batch_samples_with_gt = 0
+                batch_samples_matched = 0
                 for i, t in enumerate(targets):
                     gt = t['boxes']
                     if len(gt) == 0:
@@ -274,10 +269,40 @@ def main():
                     ious = box_iou(preds_k, gt)  # [K, G]
                     if ious.numel() == 0:
                         continue
-                    max_iou = ious.max().item()
-                    if max_iou >= args.iou_threshold:
-                        batch_correct += 1
-                    batch_total += 1
+
+                    # Greedy matching: pick highest IoU pair, remove matched row/col, repeat
+                    ious_clone = ious.clone()
+                    matched = 0
+                    while True:
+                        max_val = ious_clone.max()
+                        if max_val < args.iou_threshold:
+                            break
+                        idx = (ious_clone == max_val).nonzero(as_tuple=False)[0]
+                        p_idx = int(idx[0].item())
+                        g_idx = int(idx[1].item())
+                        pb = preds_k[p_idx]
+                        tb = gt[g_idx]
+                        loss = loss + F.mse_loss(pb, tb)
+                        num += 1
+                        matched += 1
+                        # remove matched row and column
+                        ious_clone[p_idx, :] = -1.0
+                        ious_clone[:, g_idx] = -1.0
+
+                    batch_matches += matched
+                    batch_samples_with_gt += 1
+                    if matched > 0:
+                        batch_samples_matched += 1
+
+                if num > 0:
+                    loss = loss / num
+                else:
+                    # skip updates if no targets
+                    loss = None
+
+                # Per-batch correctness: count samples that had at least one matched pair
+                batch_correct = batch_samples_matched
+                batch_total = batch_samples_with_gt
 
             if loss is None:
                 # cleanup and continue
