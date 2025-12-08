@@ -48,7 +48,7 @@ def parse_args():
     p.add_argument("--max-samples", type=int, default=0, help="If >0, limit dataset to this many samples per epoch")
     p.add_argument("--lora-r", type=int, default=4, help="LoRA rank (4-8; smaller=faster)")
     p.add_argument("--save-dir", default="vllfl_adapters_efficient")
-    p.add_argument("--device", default="auto", choices=["cuda", "cpu", "auto"], help="Device to use (auto=cuda if available)")
+    p.add_argument("--device", default="cpu", choices=["cuda", "cpu", "auto"], help="Device to use (cpu by default for portability)")
     p.add_argument("--top-k", type=int, default=3, help="Number of top predictions to consider per sample (K)")
     p.add_argument("--iou-threshold", type=float, default=0.5, help="IoU threshold to count a correct detection (accuracy)")
     p.add_argument("--cache-dataset", action="store_true", help="Preload entire dataset into RAM (faster but uses memory)")
@@ -89,7 +89,8 @@ def collate_fn(batch):
         orig_h, orig_w = target['orig_size']
         boxes_xyxy = target['boxes']
         if len(boxes_xyxy) == 0:
-            boxes_cxcywh = torch.zeros(1, 4, dtype=torch.float32)
+            # represent no boxes as an empty (0,4) tensor so callers can check len==0
+            boxes_cxcywh = torch.zeros((0, 4), dtype=torch.float32)
         else:
             boxes_norm = boxes_xyxy / torch.tensor([orig_w, orig_h, orig_w, orig_h])
             wh = boxes_norm[:, 2:] - boxes_norm[:, :2]
@@ -147,7 +148,32 @@ def main():
 
     # Load model and processor
     print("Loading model and processor...")
-    base_model = Owlv2ForObjectDetection.from_pretrained(args.checkpoint)
+    # Try to use memory-saving strategies: 8-bit quantization (bitsandbytes) or automatic device offload
+    load_in_8bit = False
+    try:
+        import bitsandbytes as bnb  # type: ignore
+        load_in_8bit = True
+    except Exception:
+        load_in_8bit = False
+
+    # Prepare kwargs for from_pretrained depending on availability
+    model_load_kwargs = {}
+    if load_in_8bit:
+        print("bitsandbytes found — attempting 8-bit load to reduce GPU memory usage.")
+        model_load_kwargs.update({"device_map": "auto", "load_in_8bit": True})
+    else:
+        # Use automatic device mapping with CPU offload as a fallback
+        print("bitsandbytes not found — using automatic device_map with CPU offload if supported.")
+        offload_dir = os.path.join(os.getcwd(), "hf_offload")
+        os.makedirs(offload_dir, exist_ok=True)
+        model_load_kwargs.update({"device_map": "auto", "offload_folder": offload_dir, "offload_state_dict": True})
+
+    try:
+        base_model = Owlv2ForObjectDetection.from_pretrained(args.checkpoint, **model_load_kwargs)
+    except Exception as e:
+        print(f"Warning: advanced loading failed ({e}), falling back to normal from_pretrained().")
+        base_model = Owlv2ForObjectDetection.from_pretrained(args.checkpoint)
+
     processor = Owlv2Processor.from_pretrained(args.checkpoint)
 
     peft_config = LoraConfig(r=args.lora_r, lora_alpha=16, target_modules=["q_proj","v_proj"], lora_dropout=0.05, bias="none")
@@ -192,6 +218,19 @@ def main():
         indices = torch.randperm(len(train_dataset))[:args.max_samples].tolist()
         train_dataset = Subset(train_dataset, indices)
         print(f"Using subset size: {len(train_dataset)}")
+
+    # Quick check: count how many samples have at least one GT box (helps debug zero-loss)
+    try:
+        non_empty = 0
+        for i in range(min(len(train_dataset), 500)):
+            sample = train_dataset[i]
+            if sample is None:
+                continue
+            if len(sample[1]['boxes']) > 0:
+                non_empty += 1
+        print(f"Samples with >=1 GT box (checked up to 500 samples): {non_empty}")
+    except Exception:
+        pass
 
     # Optionally cache entire dataset in RAM for faster epochs (uses more memory)
     if args.cache_dataset:
@@ -251,7 +290,7 @@ def main():
             with ctx:
                 outputs = model(**inputs)
                 pred_boxes = outputs.pred_boxes  # [B, Q, 4]
-                loss = torch.tensor(0.0, device=device)
+                loss = torch.zeros((), dtype=torch.float32, device=device)
                 num = 0
                 # Use up to K predictions per sample (small K)
                 K = args.top_k
@@ -280,9 +319,9 @@ def main():
                         idx = (ious_clone == max_val).nonzero(as_tuple=False)[0]
                         p_idx = int(idx[0].item())
                         g_idx = int(idx[1].item())
-                        pb = preds_k[p_idx]
-                        tb = gt[g_idx]
-                        loss = loss + F.mse_loss(pb, tb)
+                        pb = preds_k[p_idx].float()
+                        tb = gt[g_idx].float()
+                        loss = loss + F.mse_loss(pb, tb, reduction='mean')
                         num += 1
                         matched += 1
                         # remove matched row and column
