@@ -4,9 +4,18 @@ import gc
 import time
 from contextlib import nullcontext
 
-import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, ConcatDataset
+try:
+    import torch
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader, ConcatDataset
+except Exception as e:
+    raise ImportError(
+        "Failed importing torch. If you see an ImportError about typing_extensions or similar,\n"
+        "please upgrade or install a compatible `typing_extensions` version. Example:\n"
+        "  python -m pip install 'typing_extensions<4.6.0'\n"
+        "Or recreate your env with compatible torch/torchaudio versions.\n"
+        f"Original error: {e}") from e
+
 from transformers import Owlv2Processor, Owlv2ForObjectDetection
 from peft import get_peft_model, LoraConfig
 from tqdm import tqdm
@@ -34,11 +43,17 @@ def parse_args():
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--max-batches", type=int, default=0, help="If >0, stop after this many batches (smoke test)")
-    p.add_argument("--num-workers", type=int, default=4)
+    # Windows + OneDrive can be slow with multiple workers; default to 0 for safety.
+    p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--max-samples", type=int, default=0, help="If >0, limit dataset to this many samples per epoch")
     p.add_argument("--lora-r", type=int, default=8, help="LoRA rank (smaller=r for speed)")
     p.add_argument("--save-dir", default="vllfl_adapters_efficient")
     p.add_argument("--device", default="auto", choices=["cuda", "cpu", "auto"], help="Device to use (auto=cuda if available)")
+    p.add_argument("--top-k", type=int, default=3, help="Number of top predictions to consider per sample (K)")
+    p.add_argument("--iou-threshold", type=float, default=0.5, help="IoU threshold to count a correct detection (accuracy)")
+    p.add_argument("--cache-dataset", action="store_true", help="Preload entire dataset into RAM (faster but uses memory)")
+    p.add_argument("--persistent-workers", action="store_true", help="Use persistent workers in DataLoader (speeds up repeated epochs)")
+    p.add_argument("--log-file", type=str, default="training_metrics.csv", help="CSV file to append epoch loss/accuracy for federated aggregation")
     return p.parse_args()
 
 
@@ -82,6 +97,34 @@ def collate_fn(batch):
             boxes_cxcywh = torch.cat([cxcy, wh], dim=1).clamp(0, 1)
         labels.append({"boxes": boxes_cxcywh})
     return encoding, labels
+
+
+def box_iou(boxes1, boxes2):
+    # boxes: [N,4] in cx,cy,w,h (normalized) -> convert to xyxy and compute pairwise IoU
+    if boxes1.numel() == 0 or boxes2.numel() == 0:
+        return torch.zeros((boxes1.shape[0], boxes2.shape[0]), device=boxes1.device)
+
+    def cxcywh_to_xyxy(b):
+        cx, cy, w, h = b.unbind(-1)
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+        return torch.stack([x1, y1, x2, y2], dim=-1)
+
+    a = cxcywh_to_xyxy(boxes1)
+    b = cxcywh_to_xyxy(boxes2)
+
+    lt = torch.max(a[:, None, :2], b[None, :, :2])  # left-top
+    rb = torch.min(a[:, None, 2:], b[None, :, 2:])  # right-bottom
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+
+    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+    area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    union = area_a[:, None] + area_b[None, :] - inter
+    iou = inter / (union + 1e-9)
+    return iou
 
 
 def main():
@@ -132,11 +175,38 @@ def main():
         train_dataset = Subset(train_dataset, indices)
         print(f"Using subset size: {len(train_dataset)}")
 
+    # Optionally cache entire dataset in RAM for faster epochs (uses more memory)
+    if args.cache_dataset:
+        print("Caching dataset into RAM (this may use a lot of memory)...")
+        items = []
+        for i in range(len(train_dataset)):
+            items.append(train_dataset[i])
+        from torch.utils.data import Dataset as _TorchDataset
+        class InMemoryDataset(_TorchDataset):
+            def __init__(self, items):
+                self.items = items
+            def __len__(self):
+                return len(self.items)
+            def __getitem__(self, idx):
+                return self.items[idx]
+        train_dataset = InMemoryDataset(items)
+        print(f"Cached dataset size: {len(train_dataset)}")
+
     # Configure top-level collate globals so the collate function is picklable
     global COLLATE_MAX_LENGTH, COLLATE_DEVICE
     COLLATE_MAX_LENGTH = 16
     COLLATE_DEVICE = device
-    loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
+    pin_memory = True if device == 'cuda' else False
+    persistent_workers = args.persistent_workers if args.num_workers > 0 else False
+    loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        collate_fn=collate_fn,
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     if device == "cuda":
@@ -152,6 +222,8 @@ def main():
         epoch_start = time.time()
         running_loss = 0.0
         count = 0
+        epoch_correct = 0
+        epoch_total = 0
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}")
 
         for batch_idx, batch in enumerate(pbar):
@@ -172,7 +244,8 @@ def main():
                 loss = torch.tensor(0.0, device=device)
                 num = 0
                 # Use up to K predictions per sample (small K)
-                K = 3
+                K = args.top_k
+                # compute loss (MSE) over matched positions (simple pairing up to K)
                 for i, t in enumerate(targets):
                     if len(t['boxes']) == 0:
                         continue
@@ -187,6 +260,24 @@ def main():
                 else:
                     # skip updates if no targets
                     loss = None
+
+                # Simple IoU-based accuracy (per-sample): a sample is correct if any of top-K preds
+                # has IoU >= threshold with any ground-truth box.
+                batch_correct = 0
+                batch_total = 0
+                for i, t in enumerate(targets):
+                    gt = t['boxes']
+                    if len(gt) == 0:
+                        continue
+                    preds_k = pred_boxes[i, :K, :].to(device)
+                    gt = gt.to(device)
+                    ious = box_iou(preds_k, gt)  # [K, G]
+                    if ious.numel() == 0:
+                        continue
+                    max_iou = ious.max().item()
+                    if max_iou >= args.iou_threshold:
+                        batch_correct += 1
+                    batch_total += 1
 
             if loss is None:
                 # cleanup and continue
@@ -216,12 +307,18 @@ def main():
             count += 1
             global_step += 1
 
-            pbar.set_postfix({'loss': f"{(running_loss / count):.4f}", 'step': global_step})
+            # update epoch-level accuracy counters
+            epoch_correct += batch_correct
+            epoch_total += batch_total
+
+            accuracy = (epoch_correct / max(epoch_total, 1)) if epoch_total > 0 else 0.0
+            pbar.set_postfix({'loss': f"{(running_loss / count):.4f}", 'acc': f"{(accuracy*100):.2f}%", 'step': global_step})
 
             # Aggressive memory cleanup on GPU
             if device == "cuda" and (batch_idx + 1) % args.accum_steps == 0:
                 torch.cuda.empty_cache()
-                gc.collect()            # quick smoke-test exit
+                gc.collect()
+            # quick smoke-test exit
             if args.max_batches > 0 and global_step >= args.max_batches:
                 print(f"Reached max batches ({args.max_batches}), stopping early (smoke test).")
                 break
@@ -232,7 +329,19 @@ def main():
             gc.collect()
 
         epoch_time = time.time() - epoch_start
-        print(f"Epoch {epoch+1} done — avg loss: {(running_loss / max(count,1)):.4f} — time: {epoch_time:.1f}s")
+        avg_loss = (running_loss / max(count, 1))
+        accuracy = (epoch_correct / max(epoch_total, 1)) if epoch_total > 0 else 0.0
+        print(f"Epoch {epoch+1} done — avg loss: {avg_loss:.4f} — acc: {(accuracy*100):.2f}% — time: {epoch_time:.1f}s")
+
+        # Append metrics to CSV for federated aggregation or later analysis
+        try:
+            write_header = not os.path.exists(args.log_file)
+            with open(args.log_file, "a", encoding="utf-8") as f:
+                if write_header:
+                    f.write("epoch,avg_loss,accuracy,seconds\n")
+                f.write(f"{epoch+1},{avg_loss:.6f},{accuracy:.6f},{epoch_time:.1f}\n")
+        except Exception as e:
+            print(f"Warning: failed to write log file {args.log_file}: {e}")
 
         # Save checkpoint each epoch
         os.makedirs(args.save_dir, exist_ok=True)
