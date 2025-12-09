@@ -2,27 +2,28 @@ import argparse
 import os
 import gc
 import time
+import sys
+import math
 from contextlib import nullcontext
 
 try:
     import torch
     import torch.nn.functional as F
+    from torch import nn
     from torch.utils.data import DataLoader, ConcatDataset
+    from torchvision.ops import sigmoid_focal_loss, box_convert
 except Exception as e:
-    raise ImportError(
-        "Failed importing torch. If you see an ImportError about typing_extensions or similar,\n"
-        "please upgrade or install a compatible `typing_extensions` version. Example:\n"
-        "  python -m pip install 'typing_extensions<4.6.0'\n"
-        "Or recreate your env with compatible torch/torchaudio versions.\n"
-        f"Original error: {e}") from e
+    raise ImportError(f"Failed importing torch/torchvision: {e}")
 
 from transformers import Owlv2Processor, Owlv2ForObjectDetection
 from peft import get_peft_model, LoraConfig
 from tqdm import tqdm
+from scipy.optimize import linear_sum_assignment
 
 from dataset_loader import AgricultureObjectDetectionDataset
 
-# Monkey patch (same as other scripts)
+# --- MONKEY PATCH (Fixes LoRA for OWL-ViT) ---
+# This allows the PEFT library to find the input embeddings of the OWL-ViT model
 def get_input_embeddings(self):
     return self.owlv2.text_model.embeddings.token_embedding
 
@@ -32,111 +33,164 @@ def set_input_embeddings(self, value):
 Owlv2ForObjectDetection.get_input_embeddings = get_input_embeddings
 Owlv2ForObjectDetection.set_input_embeddings = set_input_embeddings
 
+# --- LOSS ENGINE (Focal Loss + Hungarian Matcher) ---
+
+def box_cxcywh_to_xyxy(x):
+    x_c, y_c, w, h = x.unbind(-1)
+    b = [(x_c - 0.5 * w), (y_c - 0.5 * h), (x_c + 0.5 * w), (y_c + 0.5 * h)]
+    return torch.stack(b, dim=-1)
+
+def box_iou(boxes1, boxes2):
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+    union = area1[:, None] + area2 - inter
+    return inter / union
+
+class HungarianMatcher(nn.Module):
+    def __init__(self, cost_class=1, cost_bbox=5, cost_giou=2):
+        super().__init__()
+        self.cost_class = cost_class
+        self.cost_bbox = cost_bbox
+        self.cost_giou = cost_giou
+
+    @torch.no_grad()
+    def forward(self, outputs, targets):
+        bs, num_queries = outputs["logits"].shape[:2]
+        out_prob = outputs["logits"].flatten(0, 1).sigmoid()
+        out_bbox = outputs["pred_boxes"].flatten(0, 1)
+
+        tgt_ids = torch.cat([v["class_labels"] for v in targets])
+        tgt_bbox = torch.cat([v["boxes"] for v in targets])
+
+        alpha = 0.25
+        gamma = 2.0
+        neg_cost_class = (1 - alpha) * (out_prob ** gamma) * (-(1 - out_prob + 1e-8).log())
+        pos_cost_class = alpha * ((1 - out_prob) ** gamma) * (-(out_prob + 1e-8).log())
+        cost_class = pos_cost_class[:, tgt_ids] - neg_cost_class[:, tgt_ids]
+
+        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
+        cost_giou = -box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+
+        C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+        C = C.view(bs, num_queries, -1).cpu()
+
+        sizes = [len(v["boxes"]) for v in targets]
+        if sum(sizes) == 0:
+            return [(torch.as_tensor([], dtype=torch.int64), torch.as_tensor([], dtype=torch.int64)) for _ in range(bs)]
+            
+        indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
+        return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
+
+class SetCriterion(nn.Module):
+    def __init__(self, num_classes, matcher, weight_dict, losses):
+        super().__init__()
+        self.num_classes = num_classes
+        self.matcher = matcher
+        self.weight_dict = weight_dict
+        self.losses = losses
+
+    def loss_labels(self, outputs, targets, indices, num_boxes):
+        src_logits = outputs['logits']
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t["class_labels"][J] for t, (_, J) in zip(targets, indices)])
+        target_classes = torch.zeros_like(src_logits)
+        target_classes[idx[0], idx[1], target_classes_o] = 1.0
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes, alpha=0.25, gamma=2.0, reduction="mean")
+        return {'loss_ce': loss_ce * src_logits.shape[1]} 
+
+    def loss_boxes(self, outputs, targets, indices, num_boxes):
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+        losses = {}
+        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+        return losses
+
+    def _get_src_permutation_idx(self, indices):
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+        src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
+
+    def get_loss(self, loss, outputs, targets, indices, num_boxes):
+        loss_map = {'labels': self.loss_labels, 'boxes': self.loss_boxes}
+        return loss_map[loss](outputs, targets, indices, num_boxes)
+
+    def forward(self, outputs, targets):
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+        indices = self.matcher(outputs_without_aux, targets)
+        num_boxes = sum(len(t["boxes"]) for t in targets)
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
+        num_boxes = torch.clamp(num_boxes, min=1).item()
+        losses = {}
+        for loss in self.losses:
+            losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
+        return losses
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data-root", default=r"C:\Users\balaj\OneDrive\Documents\project sem 5\archive\MetaFruit")
     p.add_argument("--fruits", nargs="+", default=["apple","grapefruit","lemon","orange","tangerine"])
     p.add_argument("--checkpoint", default="google/owlv2-base-patch16-ensemble")
-    p.add_argument("--batch-size", type=int, default=1, help="Per-step batch size (use 1 for CPU/small GPU)")
-    p.add_argument("--accum-steps", type=int, default=16, help="Gradient accumulation steps (CPU: use 16+)")
-    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--accum-steps", type=int, default=16)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--max-batches", type=int, default=0, help="If >0, stop after this many batches (smoke test)")
-    # Windows + OneDrive can be slow with multiple workers; default to 0 for safety.
-    p.add_argument("--num-workers", type=int, default=0)
-    p.add_argument("--max-samples", type=int, default=0, help="If >0, limit dataset to this many samples per epoch")
-    p.add_argument("--lora-r", type=int, default=4, help="LoRA rank (4-8; smaller=faster)")
+    p.add_argument("--lora-r", type=int, default=16)
+    p.add_argument("--use-lora", action="store_true", default=True)
     p.add_argument("--save-dir", default="vllfl_adapters_efficient")
-    p.add_argument("--device", default="cpu", choices=["cuda", "cpu", "auto"], help="Device to use (cpu by default for portability)")
-    p.add_argument("--top-k", type=int, default=3, help="Number of top predictions to consider per sample (K)")
-    p.add_argument("--iou-threshold", type=float, default=0.5, help="IoU threshold to count a correct detection (accuracy)")
-    p.add_argument("--cache-dataset", action="store_true", help="Preload entire dataset into RAM (faster but uses memory)")
-    p.add_argument("--persistent-workers", action="store_true", help="Use persistent workers in DataLoader (speeds up repeated epochs)")
-    p.add_argument("--log-file", type=str, default="training_metrics.csv", help="CSV file to append epoch loss/accuracy for federated aggregation")
+    p.add_argument("--device", default="cpu") 
+    p.add_argument("--log-file", type=str, default="training_metrics.csv")
     return p.parse_args()
 
-
-# Use module-level globals for collate configuration so the function is picklable
+# --- COLLATE FN ---
 COLLATE_MAX_LENGTH = 16
-COLLATE_DEVICE = 'cpu'
 
 def collate_fn(batch):
     batch = [b for b in batch if b is not None]
-    if not batch:
-        return None
+    if not batch: return None
     pixel_values = torch.stack([item[0]['pixel_values'] for item in batch])
+    
     input_ids_list = []
     attention_mask_list = []
     MAX_LENGTH = COLLATE_MAX_LENGTH
     for item in batch:
-        ids = item[0]['input_ids'].reshape(-1)
-        mask = item[0]['attention_mask'].reshape(-1)
-        ids = ids[:MAX_LENGTH]
-        mask = mask[:MAX_LENGTH]
+        ids = item[0]['input_ids'].reshape(-1)[:MAX_LENGTH]
+        mask = item[0]['attention_mask'].reshape(-1)[:MAX_LENGTH]
         if len(ids) < MAX_LENGTH:
             pad_len = MAX_LENGTH - len(ids)
             ids = torch.cat([ids, torch.zeros(pad_len, dtype=ids.dtype)])
             mask = torch.cat([mask, torch.zeros(pad_len, dtype=mask.dtype)])
         input_ids_list.append(ids)
         attention_mask_list.append(mask)
+    
     input_ids = torch.stack(input_ids_list)
     attention_mask = torch.stack(attention_mask_list)
     encoding = {'pixel_values': pixel_values, 'input_ids': input_ids, 'attention_mask': attention_mask}
+    
     labels = []
     for item in batch:
         target = item[1]
         orig_h, orig_w = target['orig_size']
         boxes_xyxy = target['boxes']
+        
         if len(boxes_xyxy) == 0:
-            # represent no boxes as an empty (0,4) tensor so callers can check len==0
             boxes_cxcywh = torch.zeros((0, 4), dtype=torch.float32)
+            class_labels = torch.zeros((0,), dtype=torch.int64)
         else:
             boxes_norm = boxes_xyxy / torch.tensor([orig_w, orig_h, orig_w, orig_h])
             wh = boxes_norm[:, 2:] - boxes_norm[:, :2]
             cxcy = (boxes_norm[:, 2:] + boxes_norm[:, :2]) / 2
             boxes_cxcywh = torch.cat([cxcy, wh], dim=1).clamp(0, 1)
-        labels.append({"boxes": boxes_cxcywh})
+            class_labels = torch.zeros(len(boxes_cxcywh), dtype=torch.int64)
+
+        labels.append({"boxes": boxes_cxcywh, "class_labels": class_labels})
+        
     return encoding, labels
-
-
-def box_iou(boxes1, boxes2):
-    # boxes: [N,4] in cx,cy,w,h (normalized) -> convert to xyxy and compute pairwise IoU
-    if boxes1.numel() == 0 or boxes2.numel() == 0:
-        return torch.zeros((boxes1.shape[0], boxes2.shape[0]), device=boxes1.device)
-
-    def cxcywh_to_xyxy(b):
-        cx, cy, w, h = b.unbind(-1)
-        x1 = cx - w / 2
-        y1 = cy - h / 2
-        x2 = cx + w / 2
-        y2 = cy + h / 2
-        return torch.stack([x1, y1, x2, y2], dim=-1)
-
-    a = cxcywh_to_xyxy(boxes1)
-    b = cxcywh_to_xyxy(boxes2)
-
-    lt = torch.max(a[:, None, :2], b[None, :, :2])  # left-top
-    rb = torch.min(a[:, None, 2:], b[None, :, 2:])  # right-bottom
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[:, :, 0] * wh[:, :, 1]
-
-    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
-    area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
-    union = area_a[:, None] + area_b[None, :] - inter
-    iou = inter / (union + 1e-9)
-    return iou
-
-
-class InMemoryDataset(torch.utils.data.Dataset):
-    """A small top-level Dataset to hold items in memory."""
-    def __init__(self, items):
-        self.items = items
-    def __len__(self):
-        return len(self.items)
-    def __getitem__(self, idx):
-        return self.items[idx]
-
 
 def main():
     args = parse_args()
@@ -146,280 +200,108 @@ def main():
         device = args.device
     print(f"Device: {device}")
 
-    # Load model and processor
     print("Loading model and processor...")
-    # Try to use memory-saving strategies: 8-bit quantization (bitsandbytes) or automatic device offload
-    load_in_8bit = False
-    try:
-        import bitsandbytes as bnb  # type: ignore
-        load_in_8bit = True
-    except Exception:
-        load_in_8bit = False
-
-    # Prepare kwargs for from_pretrained depending on availability
-    model_load_kwargs = {}
-    if load_in_8bit:
-        print("bitsandbytes found — attempting 8-bit load to reduce GPU memory usage.")
-        model_load_kwargs.update({"device_map": "auto", "load_in_8bit": True})
-    else:
-        # Use automatic device mapping with CPU offload as a fallback
-        print("bitsandbytes not found — using automatic device_map with CPU offload if supported.")
-        offload_dir = os.path.join(os.getcwd(), "hf_offload")
-        os.makedirs(offload_dir, exist_ok=True)
-        model_load_kwargs.update({"device_map": "auto", "offload_folder": offload_dir, "offload_state_dict": True})
-
-    try:
-        base_model = Owlv2ForObjectDetection.from_pretrained(args.checkpoint, **model_load_kwargs)
-    except Exception as e:
-        print(f"Warning: advanced loading failed ({e}), falling back to normal from_pretrained().")
-        base_model = Owlv2ForObjectDetection.from_pretrained(args.checkpoint)
-
+    base_model = Owlv2ForObjectDetection.from_pretrained(args.checkpoint)
     processor = Owlv2Processor.from_pretrained(args.checkpoint)
 
-    peft_config = LoraConfig(r=args.lora_r, lora_alpha=16, target_modules=["q_proj","v_proj"], lora_dropout=0.05, bias="none")
-    model = get_peft_model(base_model, peft_config)
+    if args.use_lora and args.lora_r > 0:
+        print(f"Using LoRA with rank {args.lora_r}...")
+        peft_config = LoraConfig(r=args.lora_r, lora_alpha=32, target_modules=["q_proj","v_proj"], lora_dropout=0.05, bias="none")
+        model = get_peft_model(base_model, peft_config)
+        
+        # CRITICAL FIX: Ensure inputs require grads so checkpointing works with frozen weights
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        else:
+            def make_inputs_require_grad(module, input, output):
+                output.requires_grad_(True)
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+            
+        model.print_trainable_parameters()
+    else:
+        print("Training full model...")
+        model = base_model
+    
     model.to(device)
     model.train()
-    model.print_trainable_parameters()
 
-    # Enable gradient checkpointing on CPU/small GPU to save memory (trades compute for memory)
-    # On CUDA, disable it and use gradient accumulation instead.
+    # Enable Gradient Checkpointing
     if device == "cpu":
         try:
             model.gradient_checkpointing_enable()
-            print("Gradient checkpointing enabled for CPU training.")
-        except Exception as e:
-            print(f"Warning: could not enable gradient checkpointing: {e}")
-    else:
-        try:
-            model.gradient_checkpointing_disable()
-        except Exception:
-            pass
+        except: pass
 
-    # Dataset
+    # Initialize Loss Criterion
+    matcher = HungarianMatcher(cost_class=1, cost_bbox=5, cost_giou=2)
+    weight_dict = {'loss_ce': 2, 'loss_bbox': 5}
+    losses = ['labels', 'boxes']
+    criterion = SetCriterion(1, matcher, weight_dict, losses)
+    criterion.to(device)
+
     print("Building datasets...")
     all_datasets = []
     for fruit in args.fruits:
         d_path = os.path.join(args.data_root, fruit)
         if os.path.exists(d_path):
-            ds = AgricultureObjectDetectionDataset(d_path, processor, [["apple","grapefruit","lemon","orange","tangerine","leaf","person"]], fruit_type=fruit)
+            ds = AgricultureObjectDetectionDataset(d_path, processor, [[fruit]], fruit_type=fruit)
             if len(ds) > 0:
                 all_datasets.append(ds)
                 print(f"  Loaded {len(ds)} from {fruit}")
+    
     if not all_datasets:
-        print("No datasets found. Check data root.")
+        print("No datasets found!")
         return
-    train_dataset = ConcatDataset(all_datasets)
-    print(f"Full dataset size: {len(train_dataset)}")
-
-    # Optionally limit samples
-    if args.max_samples > 0:
-        from torch.utils.data import Subset
-        indices = torch.randperm(len(train_dataset))[:args.max_samples].tolist()
-        train_dataset = Subset(train_dataset, indices)
-        print(f"Using subset size: {len(train_dataset)}")
-
-    # Quick check: count how many samples have at least one GT box (helps debug zero-loss)
-    try:
-        non_empty = 0
-        for i in range(min(len(train_dataset), 500)):
-            sample = train_dataset[i]
-            if sample is None:
-                continue
-            if len(sample[1]['boxes']) > 0:
-                non_empty += 1
-        print(f"Samples with >=1 GT box (checked up to 500 samples): {non_empty}")
-    except Exception:
-        pass
-
-    # Optionally cache entire dataset in RAM for faster epochs (uses more memory)
-    if args.cache_dataset:
-        print("Caching dataset into RAM (this may use a lot of memory)...")
-        items = []
-        for i in range(len(train_dataset)):
-            items.append(train_dataset[i])
-        train_dataset = InMemoryDataset(items)
-        print(f"Cached dataset size: {len(train_dataset)}")
-
-    # Configure top-level collate globals so the collate function is picklable
-    global COLLATE_MAX_LENGTH, COLLATE_DEVICE
-    COLLATE_MAX_LENGTH = 16
-    COLLATE_DEVICE = device
-    pin_memory = True if device == 'cuda' else False
-    persistent_workers = args.persistent_workers if args.num_workers > 0 else False
-    loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=persistent_workers,
-        collate_fn=collate_fn,
-    )
+        
+    full_dataset = ConcatDataset(all_datasets)
+    train_loader = DataLoader(full_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    if device == "cuda":
-        scaler = torch.amp.GradScaler(device=device)
-    else:
-        scaler = None
-
-    global_step = 0
-    total_start = time.time()
-
+    
+    print("Starting training...")
     for epoch in range(args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
-        epoch_start = time.time()
         running_loss = 0.0
         count = 0
-        epoch_correct = 0
-        epoch_total = 0
-        pbar = tqdm(loader, desc=f"Epoch {epoch+1}")
+        pbar = tqdm(train_loader)
 
         for batch_idx, batch in enumerate(pbar):
-            if batch is None:
-                continue
+            if batch is None: continue
             inputs, targets = batch
-            # Move inputs to device
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
-            # forward + loss under AMP
-            if device == "cuda":
-                ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float32)
-            else:
-                ctx = nullcontext()
-            with ctx:
-                outputs = model(**inputs)
-                pred_boxes = outputs.pred_boxes  # [B, Q, 4]
-                loss = torch.zeros((), dtype=torch.float32, device=device)
-                num = 0
-                # Use up to K predictions per sample (small K)
-                K = args.top_k
+            # Forward Pass
+            outputs = model(**inputs)
+            
+            output_dict = {
+                "logits": outputs.logits,
+                "pred_boxes": outputs.pred_boxes
+            }
+            target_list = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            
+            loss_dict = criterion(output_dict, target_list)
+            weight_dict = criterion.weight_dict
+            loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
-                # We'll perform greedy IoU matching between top-K preds and GT boxes
-                batch_matches = 0
-                batch_samples_with_gt = 0
-                batch_samples_matched = 0
-                for i, t in enumerate(targets):
-                    gt = t['boxes']
-                    if len(gt) == 0:
-                        continue
-                    preds_k = pred_boxes[i, :K, :].to(device)
-                    gt = gt.to(device)
-                    ious = box_iou(preds_k, gt)  # [K, G]
-                    if ious.numel() == 0:
-                        continue
-
-                    # Greedy matching: pick highest IoU pair, remove matched row/col, repeat
-                    ious_clone = ious.clone()
-                    matched = 0
-                    while True:
-                        max_val = ious_clone.max()
-                        if max_val < args.iou_threshold:
-                            break
-                        idx = (ious_clone == max_val).nonzero(as_tuple=False)[0]
-                        p_idx = int(idx[0].item())
-                        g_idx = int(idx[1].item())
-                        pb = preds_k[p_idx].float()
-                        tb = gt[g_idx].float()
-                        loss = loss + F.mse_loss(pb, tb, reduction='mean')
-                        num += 1
-                        matched += 1
-                        # remove matched row and column
-                        ious_clone[p_idx, :] = -1.0
-                        ious_clone[:, g_idx] = -1.0
-
-                    batch_matches += matched
-                    batch_samples_with_gt += 1
-                    if matched > 0:
-                        batch_samples_matched += 1
-
-                if num > 0:
-                    loss = loss / num
-                else:
-                    # skip updates if no targets
-                    loss = None
-
-                # Per-batch correctness: count samples that had at least one matched pair
-                batch_correct = batch_samples_matched
-                batch_total = batch_samples_with_gt
-
-            if loss is None:
-                # cleanup and continue
-                del inputs, targets, outputs
-                if device == "cuda":
-                    torch.cuda.empty_cache()
-                gc.collect()
+            if not math.isfinite(loss.item()):
+                print(f"Loss is {loss.item()}, skipping batch")
                 continue
 
-            # backward with accumulation
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                if (batch_idx + 1) % args.accum_steps == 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-            else:
-                loss.backward()
-                if (batch_idx + 1) % args.accum_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
+            # Backward Pass
+            loss.backward()
+            
+            if (batch_idx + 1) % args.accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
 
             running_loss += loss.item()
             count += 1
-            global_step += 1
+            pbar.set_postfix({'loss': f"{(running_loss / count):.4f}"})
 
-            # update epoch-level accuracy counters
-            epoch_correct += batch_correct
-            epoch_total += batch_total
-
-            accuracy = (epoch_correct / max(epoch_total, 1)) if epoch_total > 0 else 0.0
-            pbar.set_postfix({'loss': f"{(running_loss / count):.4f}", 'acc': f"{(accuracy*100):.2f}%", 'step': global_step})
-
-            # Aggressive memory cleanup on GPU
-            if device == "cuda" and (batch_idx + 1) % args.accum_steps == 0:
-                torch.cuda.empty_cache()
-                gc.collect()
-            # quick smoke-test exit
-            if args.max_batches > 0 and global_step >= args.max_batches:
-                print(f"Reached max batches ({args.max_batches}), stopping early (smoke test).")
-                break
-
-            # cleanup
-            del inputs, targets, outputs
-            torch.cuda.empty_cache()
-            gc.collect()
-
-        epoch_time = time.time() - epoch_start
-        avg_loss = (running_loss / max(count, 1))
-        accuracy = (epoch_correct / max(epoch_total, 1)) if epoch_total > 0 else 0.0
-        print(f"Epoch {epoch+1} done — avg loss: {avg_loss:.4f} — acc: {(accuracy*100):.2f}% — time: {epoch_time:.1f}s")
-
-        # Append metrics to CSV for federated aggregation or later analysis
-        try:
-            write_header = not os.path.exists(args.log_file)
-            with open(args.log_file, "a", encoding="utf-8") as f:
-                if write_header:
-                    f.write("epoch,avg_loss,accuracy,seconds\n")
-                f.write(f"{epoch+1},{avg_loss:.6f},{accuracy:.6f},{epoch_time:.1f}\n")
-        except Exception as e:
-            print(f"Warning: failed to write log file {args.log_file}: {e}")
-
-        # Save checkpoint each epoch
+        # Save Checkpoint
         os.makedirs(args.save_dir, exist_ok=True)
-        ckpt_path = os.path.join(args.save_dir, f"adapters_epoch{epoch+1}.pt")
-        print(f"Saving checkpoint to {ckpt_path} (LoRA adapters)")
         model.save_pretrained(args.save_dir)
-
-        if args.max_batches > 0 and global_step >= args.max_batches:
-            break
-
-    total_time = time.time() - total_start
-    print(f"Total training time: {total_time:.1f}s")
-    print("Done.")
-
+        print(f"Saved epoch {epoch+1} to {args.save_dir}")
 
 if __name__ == '__main__':
     main()
