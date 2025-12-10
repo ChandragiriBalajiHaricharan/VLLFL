@@ -139,7 +139,7 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--accum-steps", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--use-lora", action="store_true", default=True)
     p.add_argument("--save-dir", default="vllfl_adapters_efficient")

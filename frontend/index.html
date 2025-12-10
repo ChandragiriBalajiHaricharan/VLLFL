@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VLLFL Project Demo</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background-color: #f4f4f9; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+        h1 { color: #333; }
+        .container { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); width: 800px; text-align: center; }
+        
+        .controls { margin-bottom: 20px; display: flex; gap: 10px; justify-content: center; }
+        input[type="file"] { padding: 10px; border: 1px solid #ddd; border-radius: 6px; }
+        input[type="text"] { padding: 10px; border: 1px solid #ddd; border-radius: 6px; width: 250px; }
+        button { background-color: #28a745; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 16px; }
+        button:hover { background-color: #218838; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+
+        #canvas-container { position: relative; display: inline-block; margin-top: 20px; border: 2px dashed #ccc; min-height: 300px; width: 100%; display: flex; justify-content: center; align-items: center; }
+        canvas { max-width: 100%; display: block; }
+        
+        .loading { display: none; margin-top: 10px; color: #666; font-weight: bold; }
+        .stats { margin-top: 15px; font-size: 14px; color: #555; text-align: left; }
+    </style>
+</head>
+<body>
+
+    <h1>🍎 VLLFL: Federated Crop Disease Detection</h1>
+    
+    <div class="container">
+        <div class="controls">
+            <input type="file" id="imageInput" accept="image/*">
+            <input type="text" id="promptInput" value="apple, orange, lemon, person" placeholder="Enter objects to detect...">
+            <button onclick="uploadImage()" id="predictBtn">Analyze Image</button>
+        </div>
+
+        <div class="loading" id="loadingText">⏳ Running Global Model... Please wait...</div>
+
+        <div id="canvas-container">
+            <p style="color: #aaa;" id="placeholder">Upload an image to see results</p>
+            <canvas id="resultCanvas"></canvas>
+        </div>
+
+        <div class="stats" id="statsOutput"></div>
+    </div>
+
+    <script>
+        async function uploadImage() {
+            const input = document.getElementById('imageInput');
+            const prompt = document.getElementById('promptInput').value;
+            const btn = document.getElementById('predictBtn');
+            const loading = document.getElementById('loadingText');
+            const canvas = document.getElementById('resultCanvas');
+            const ctx = canvas.getContext('2d');
+            const stats = document.getElementById('statsOutput');
+            const placeholder = document.getElementById('placeholder');
+
+            if (!input.files[0]) {
+                alert("Please select an image first!");
+                return;
+            }
+
+            // UI Updates
+            btn.disabled = true;
+            loading.style.display = 'block';
+            stats.innerHTML = '';
+            placeholder.style.display = 'none';
+
+            // Prepare Data
+            const formData = new FormData();
+            formData.append('file', input.files[0]);
+            formData.append('texts', prompt);
+
+            try {
+                // 1. Draw original image first
+                const img = new Image();
+                img.src = URL.createObjectURL(input.files[0]);
+                
+                await new Promise(r => img.onload = r);
+                
+                // Resize canvas to match image
+                canvas.width = img.width;
+                canvas.height = img.height;
+                ctx.drawImage(img, 0, 0);
+
+                // 2. Send to Backend
+                // Make sure your python app.py is running!
+                const response = await fetch('http://localhost:5000/predict', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) throw new Error("Backend Error");
+                
+                const data = await response.json();
+
+                // 3. Draw Boxes
+                let count = 0;
+                data.predictions.forEach(pred => {
+                    const [x1, y1, x2, y2] = pred.box;
+                    const width = x2 - x1;
+                    const height = y2 - y1;
+
+                    // Box Styling
+                    ctx.strokeStyle = '#00FF00'; // Green Box
+                    ctx.lineWidth = 4;
+                    ctx.strokeRect(x1, y1, width, height);
+
+                    // Label Styling
+                    ctx.fillStyle = '#00FF00';
+                    ctx.font = 'bold 24px Arial';
+                    ctx.fillText(`${pred.label} (${Math.round(pred.score * 100)}%)`, x1, y1 - 10);
+                    count++;
+                });
+
+                stats.innerHTML = `✅ <strong>Analysis Complete:</strong> Detected ${count} objects using Federated Weights.`;
+
+            } catch (error) {
+                console.error(error);
+                alert("Failed to connect to backend. Is 'python app.py' running?");
+            } finally {
+                btn.disabled = false;
+                loading.style.display = 'none';
+            }
+        }
+    </script>
+</body>
+</html>
