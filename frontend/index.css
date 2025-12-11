@@ -1,0 +1,168 @@
+/* Global layout */
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* Base typography & background */
+body {
+  font-family: 'Inter', system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: linear-gradient(180deg, #f8faf9 0%, #f0f4f1 100%);
+  color: #1a2e1a;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Headings use Playfair Display for formal, professional look */
+h1,
+h2,
+h3,
+.display-heading {
+  font-family: "Playfair Display", Georgia, serif;
+  /* color: #ecf714; */
+  font-weight: 600;
+}
+
+h2,
+.display-heading {
+  font-family: "Playfair Display", Georgia, serif;
+  /* color: #ecf714; */
+  font-weight: 600;
+}
+
+/* Professional card styling with subtle shadows */
+.card {
+  background: #ffffff;
+  border-radius: 0.75rem;
+  box-shadow:
+    0 1px 3px rgba(26, 46, 26, 0.08),
+    0 1px 2px rgba(26, 46, 26, 0.06);
+  transition: box-shadow 0.3s ease;
+}
+
+.card:hover {
+  box-shadow:
+    0 4px 6px rgba(26, 46, 26, 0.1),
+    0 2px 4px rgba(26, 46, 26, 0.08);
+}
+
+/* Enhanced input styling */
+.input {
+  width: 100%;
+  border: 1.5px solid #d1d9d1;
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem;
+  font-size: 0.9375rem;
+  outline: none;
+  transition: all 0.2s ease;
+  background: #ffffff;
+}
+
+.input:focus {
+  border-color: #4a7c4e;
+  box-shadow: 0 0 0 3px rgba(74, 124, 78, 0.1);
+}
+
+.input::placeholder {
+  color: #9ca89c;
+}
+
+/* Professional button styling */
+.btn-primary {
+  background: linear-gradient(135deg, #e2eee3 0%, #3d6640 100%);
+  color: #ffffff;
+  border: none;
+  border-radius: 0.5rem;
+  padding: 0.75rem 1.5rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  box-shadow: 0 2px 4px rgba(138, 175, 141, 0.2);
+}
+
+.btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px rgba(159, 186, 161, 0.3);
+}
+
+.btn-primary:active {
+  transform: translateY(0);
+}
+
+/* Secondary button for less prominent actions */
+.btn-secondary {
+  background: #f8faf9;
+  color: #4a7c4e;
+  border: 1.5px solid #d1d9d1;
+  border-radius: 0.5rem;
+  padding: 0.75rem 1.5rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-secondary:hover {
+  background: #e8f0e9;
+  border-color: #4a7c4e;
+}
+
+/* Muted text color */
+.text-muted {
+  color: #7c736b;
+}
+
+/* Alert/notification styling */
+.alert {
+  padding: 0.875rem 1rem;
+  border-radius: 0.5rem;
+  font-size: 0.875rem;
+  margin-bottom: 1rem;
+}
+
+.alert-error {
+  background: #fef2f2;
+  color: #991b1b;
+  border: 1px solid #fecaca;
+}
+
+.alert-success {
+  background: #f0fdf4;
+  color: #166534;
+  border: 1px solid #bbf7d0;
+}
+
+/* Link styling */
+a {
+  color: #4a7c4e;
+  text-decoration: none;
+  transition: color 0.2s ease;
+}
+
+a:hover {
+  color: #3d6640;
+  text-decoration: underline;
+}
+
+/* Professional navbar styling */
+.navbar-link {
+  color: #4a5a4a;
+  font-weight: 500;
+  transition: color 0.2s ease;
+}
+
+.navbar-link:hover {
+  color: #1a2e1a;
+  text-decoration: none;
+}
+
+/* Badge styling for user info */
+.badge {
+  display: inline-block;
+  padding: 0.25rem 0.75rem;
+  background: #e8f0e9;
+  color: #3d6640;
+  border-radius: 1rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+}
